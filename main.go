@@ -11,19 +11,21 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	binance "github.com/adshao/go-binance/v2/futures"
 	"github.com/joho/godotenv"
 )
 
-// Configuration defaults
+// Configuration defaults for the trading bot.
 const (
 	defaultSLPercentVal = 1.0
 	defaultTPPercentVal = 3.0
 	defaultSLFixedVal   = true
 )
 
-// Config holds application configuration loaded from environment
+// Config holds application configuration loaded from environment.
 type Config struct {
 	DefaultSLPercent float64
 	TPPercent        float64
@@ -31,13 +33,13 @@ type Config struct {
 	// Add other configuration values here
 }
 
-// SymbolPrecision stores price and quantity precision information for a trading symbol
+// SymbolPrecision stores price and quantity precision information for a trading symbol.
 type SymbolPrecision struct {
 	PricePrecision    int
 	QuantityPrecision int
 }
 
-// PositionData contains all calculated data for a futures position
+// PositionData contains all calculated data for a futures position.
 type PositionData struct {
 	Symbol           string
 	PositionSide     string
@@ -65,7 +67,44 @@ type PositionData struct {
 	RiskReward       float64
 }
 
-// loadConfig loads configuration from environment variables with defaults
+// StopLossLevel defines a profit threshold and corresponding stop-loss level.
+type StopLossLevel struct {
+	ProfitThreshold float64 // Profit threshold
+	StopLossValue   float64 // Corresponding stop-loss level
+}
+
+// TradingService handles all trading operations.
+type TradingService struct {
+	client     *binance.Client
+	config     Config
+	symbolInfo map[string]SymbolPrecision
+	stopLevels []StopLossLevel
+}
+
+// NewTradingService creates and initializes a new trading service.
+func NewTradingService(client *binance.Client, config Config) (*TradingService, error) {
+	// Initialize stop-loss levels
+	stopLevels := []StopLossLevel{
+		{150, 0}, {300, 100}, {450, 200}, {600, 300},
+		{750, 400}, {900, 500}, {1050, 600}, {1200, 700},
+		{1350, 800}, {1500, 900},
+	}
+
+	// Get symbol precision information
+	symbolInfo, err := getSymbolPrecisions(client)
+	if err != nil {
+		return nil, fmt.Errorf("error getting exchange information: %w", err)
+	}
+
+	return &TradingService{
+		client:     client,
+		config:     config,
+		symbolInfo: symbolInfo,
+		stopLevels: stopLevels,
+	}, nil
+}
+
+// loadConfig loads configuration from environment variables with defaults.
 func loadConfig() Config {
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
@@ -100,10 +139,14 @@ func loadConfig() Config {
 	return config
 }
 
-// sendTelegramMessage sends a notification to the configured Telegram chat
+// sendTelegramMessage sends a notification to the configured Telegram chat.
 func sendTelegramMessage(message string) error {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+
+	if botToken == "" || chatID == "" {
+		return fmt.Errorf("telegram configuration missing")
+	}
 
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
 
@@ -116,32 +159,43 @@ func sendTelegramMessage(message string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("telegram API returned error code: %d", resp.StatusCode)
 	}
 	return nil
 }
 
-// setupBinanceClient initializes and validates the Binance API client
+// setupBinanceClient initializes and validates the Binance API client.
 func setupBinanceClient() (*binance.Client, error) {
 	apiKey := os.Getenv("BINANCE_API_KEY")
 	apiSecret := os.Getenv("BINANCE_API_SECRET")
+
+	if apiKey == "" || apiSecret == "" {
+		return nil, fmt.Errorf("binance API credentials not configured")
+	}
 
 	client := binance.NewClient(apiKey, apiSecret)
 
 	// Validate API connection
 	_, err := client.NewGetAccountService().Do(context.Background())
-	return client, err
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Binance API: %w", err)
+	}
+
+	return client, nil
 }
 
-// getSymbolPrecisions retrieves precision information for all trading symbols
+// getSymbolPrecisions retrieves precision information for all trading symbols.
 func getSymbolPrecisions(client *binance.Client) (map[string]SymbolPrecision, error) {
-	exchangeInfo, err := client.NewExchangeInfoService().Do(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	exchangeInfo, err := client.NewExchangeInfoService().Do(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	symbolInfo := make(map[string]SymbolPrecision)
+	symbolInfo := make(map[string]SymbolPrecision, len(exchangeInfo.Symbols))
 	for _, info := range exchangeInfo.Symbols {
 		symbolInfo[info.Symbol] = SymbolPrecision{
 			PricePrecision:    info.PricePrecision,
@@ -151,23 +205,13 @@ func getSymbolPrecisions(client *binance.Client) (map[string]SymbolPrecision, er
 	return symbolInfo, nil
 }
 
-// calculateStopLoss determines the stop-loss price based on current profit levels
-func calculateStopLoss(data *PositionData, config Config) float64 {
-	// Define stop-loss levels based on profit thresholds
-	slLevels := []struct {
-		tp float64 // profit threshold
-		sl float64 // corresponding stop-loss level
-	}{
-		{150, 0}, {300, 100}, {450, 200}, {600, 300},
-		{750, 400}, {900, 500}, {1050, 600}, {1200, 700},
-		{1350, 800}, {1500, 900},
-	}
-
+// calculateStopLoss determines the stop-loss price based on current profit levels.
+func (ts *TradingService) calculateStopLoss(data *PositionData) float64 {
 	// Determine current stop-loss percentage based on profit levels
-	currentSLPct := config.DefaultSLPercent
-	for _, level := range slLevels {
-		if data.CurrentProfitPct >= level.tp {
-			currentSLPct = level.sl
+	currentSLPct := ts.config.DefaultSLPercent
+	for _, level := range ts.stopLevels {
+		if data.CurrentProfitPct >= level.ProfitThreshold {
+			currentSLPct = level.StopLossValue
 		} else {
 			break
 		}
@@ -177,13 +221,13 @@ func calculateStopLoss(data *PositionData, config Config) float64 {
 	// Calculate stop price based on position direction and settings
 	var stopPrice float64
 	if data.IsLong {
-		if config.SLFixed {
+		if ts.config.SLFixed {
 			stopPrice = data.EntryPrice * (1 + currentSLPct/data.Leverage/100)
 		} else {
 			stopPrice = data.MarkPrice - (data.MarkPrice-data.EntryPrice)*(currentSLPct/data.CurrentProfitPct)
 		}
 	} else {
-		if config.SLFixed {
+		if ts.config.SLFixed {
 			stopPrice = data.EntryPrice * (1 - currentSLPct/data.Leverage/100)
 		} else {
 			stopPrice = data.MarkPrice + (data.EntryPrice-data.MarkPrice)*(currentSLPct/data.CurrentProfitPct)
@@ -201,17 +245,17 @@ func calculateStopLoss(data *PositionData, config Config) float64 {
 	return stopPrice
 }
 
-// calculateTakeProfit determines the take-profit price
-func calculateTakeProfit(data *PositionData, config Config) float64 {
+// calculateTakeProfit determines the take-profit price.
+func (ts *TradingService) calculateTakeProfit(data *PositionData) float64 {
 	var takePrice float64
 
 	if data.IsLong {
-		takePrice = data.EntryPrice * (1 + config.TPPercent/100)
+		takePrice = data.EntryPrice * (1 + ts.config.TPPercent/100)
 		if takePrice <= data.MarkPrice {
 			takePrice = data.MarkPrice * 1.005 // Slightly above current price
 		}
 	} else {
-		takePrice = data.EntryPrice * (1 - config.TPPercent/100)
+		takePrice = data.EntryPrice * (1 - ts.config.TPPercent/100)
 		if takePrice >= data.MarkPrice {
 			takePrice = data.MarkPrice * 0.995 // Slightly below current price
 		}
@@ -228,15 +272,57 @@ func calculateTakeProfit(data *PositionData, config Config) float64 {
 	return takePrice
 }
 
-// cancelExistingOrders removes all open orders for a symbol
-func cancelExistingOrders(client *binance.Client, symbol string) error {
-	openOrders, err := client.NewListOpenOrdersService().Symbol(symbol).Do(context.Background())
+// getCurrentStopLoss retrieves the current stop-loss price from open orders.
+func (ts *TradingService) getCurrentStopLoss(symbol string, positionSide string) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	// Get all open orders for the symbol
+	openOrders, err := ts.client.NewListOpenOrdersService().Symbol(symbol).Do(ctx)
 	if err != nil {
-		return fmt.Errorf("error fetching open orders for %s: %v", symbol, err)
+		return 0, fmt.Errorf("error fetching open orders for %s: %w", symbol, err)
+	}
+
+	// Find stop-loss order
+	for _, order := range openOrders {
+		// Check if this is a stop-loss order (STOP_MARKET)
+		if order.Type == "STOP_MARKET" {
+			// Check position side based on value
+			// Skip this check if positionSide is "BOTH"
+			if positionSide != "BOTH" {
+				// Convert both to comparable strings for safe comparison
+				orderPosSide := order.PositionSide
+				if (positionSide == "LONG" && orderPosSide != "LONG") ||
+					(positionSide == "SHORT" && orderPosSide != "SHORT") {
+					continue
+				}
+			}
+
+			// Get the stop price
+			stopPrice, err := strconv.ParseFloat(order.StopPrice, 64)
+			if err != nil {
+				return 0, fmt.Errorf("error parsing stop price: %w", err)
+			}
+			return stopPrice, nil
+		}
+	}
+
+	// No stop-loss order found
+	return 0, nil
+}
+
+// cancelExistingOrders removes all open orders for a symbol.
+func (ts *TradingService) cancelExistingOrders(symbol string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	openOrders, err := ts.client.NewListOpenOrdersService().Symbol(symbol).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("error fetching open orders for %s: %w", symbol, err)
 	}
 
 	for _, order := range openOrders {
-		_, err := client.NewCancelOrderService().Symbol(symbol).OrderID(order.OrderID).Do(context.Background())
+		_, err := ts.client.NewCancelOrderService().Symbol(symbol).OrderID(order.OrderID).Do(ctx)
 		if err != nil {
 			log.Printf("Error canceling order %d for %s: %v", order.OrderID, symbol, err)
 		}
@@ -244,7 +330,7 @@ func cancelExistingOrders(client *binance.Client, symbol string) error {
 	return nil
 }
 
-// getOrderSideInfo determines the appropriate side and position side for orders
+// getOrderSideInfo determines the appropriate side and position side for orders.
 func getOrderSideInfo(positionSide string, posAmt float64) (binance.SideType, binance.PositionSideType) {
 	var closeSide binance.SideType
 	var positionSideForOrder binance.PositionSideType
@@ -268,8 +354,8 @@ func getOrderSideInfo(positionSide string, posAmt float64) (binance.SideType, bi
 	return closeSide, positionSideForOrder
 }
 
-// createStopLossOrder places a stop-loss order for a position
-func createStopLossOrder(client *binance.Client, data *PositionData) error {
+// createStopLossOrder places a stop-loss order for a position.
+func (ts *TradingService) createStopLossOrder(data *PositionData) error {
 	if data.CurrentSLPct <= 0 || data.StopPrice <= 0 || data.StopPrice == data.EntryPrice {
 		return nil // No stop-loss needed
 	}
@@ -279,8 +365,11 @@ func createStopLossOrder(client *binance.Client, data *PositionData) error {
 
 	closeSide, positionSideForOrder := getOrderSideInfo(data.PositionSide, data.PositionAmt)
 
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
 	// Create the stop-loss order
-	slOrderService := client.NewCreateOrderService().
+	slOrderService := ts.client.NewCreateOrderService().
 		Symbol(data.Symbol).
 		Side(closeSide).
 		Type(binance.OrderTypeStopMarket).
@@ -292,15 +381,15 @@ func createStopLossOrder(client *binance.Client, data *PositionData) error {
 		slOrderService = slOrderService.PositionSide(positionSideForOrder)
 	}
 
-	_, err := slOrderService.Do(context.Background())
+	_, err := slOrderService.Do(ctx)
 	if err != nil {
-		return fmt.Errorf("error setting Stop Loss order for %s: %v", data.Symbol, err)
+		return fmt.Errorf("error setting Stop Loss order for %s: %w", data.Symbol, err)
 	}
 	return nil
 }
 
-// createTakeProfitOrder places a take-profit order for a position
-func createTakeProfitOrder(client *binance.Client, data *PositionData) error {
+// createTakeProfitOrder places a take-profit order for a position.
+func (ts *TradingService) createTakeProfitOrder(data *PositionData) error {
 	// Check if TP has already been reached
 	if (data.IsLong && data.MarkPrice >= data.TakePrice) ||
 		(data.IsShort && data.MarkPrice <= data.TakePrice) {
@@ -311,8 +400,11 @@ func createTakeProfitOrder(client *binance.Client, data *PositionData) error {
 
 	closeSide, positionSideForOrder := getOrderSideInfo(data.PositionSide, data.PositionAmt)
 
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
 	// Create the take-profit order
-	tpOrderService := client.NewCreateOrderService().
+	tpOrderService := ts.client.NewCreateOrderService().
 		Symbol(data.Symbol).
 		Side(closeSide).
 		Type(binance.OrderTypeTakeProfitMarket).
@@ -324,19 +416,32 @@ func createTakeProfitOrder(client *binance.Client, data *PositionData) error {
 		tpOrderService = tpOrderService.PositionSide(positionSideForOrder)
 	}
 
-	_, err := tpOrderService.Do(context.Background())
+	_, err := tpOrderService.Do(ctx)
 	if err != nil {
-		return fmt.Errorf("error setting Take Profit order for %s: %v", data.Symbol, err)
+		return fmt.Errorf("error setting Take Profit order for %s: %w", data.Symbol, err)
 	}
 	return nil
 }
 
-// formatPositionMessage creates a formatted position summary for logging and notification
+// formatPositionMessage creates a formatted position summary for logging and notification.
 func formatPositionMessage(data *PositionData) string {
 	// Determine icon based on position direction
 	sideIcon := "🔴 SHORT"
 	if data.IsLong {
 		sideIcon = "🟢 LONG"
+	}
+
+	// Format the message
+	var slText string
+	if data.CurrentSLPct > 0 {
+		slText = fmt.Sprintf("%.2f", data.StopPrice)
+	} else {
+		slText = "NONE"
+	}
+
+	var potentialLoss float64
+	if data.CurrentSLPct > 0 {
+		potentialLoss = math.Abs(data.PotentialLoss)
 	}
 
 	// Format the message
@@ -351,44 +456,46 @@ func formatPositionMessage(data *PositionData) string {
 		data.Symbol, sideIcon,
 		data.EntryPrice, data.MarkPrice,
 		data.CurrentProfitPct, data.RawProfitPct, int(data.Leverage),
-		func() string {
-			if data.CurrentSLPct > 0 {
-				return fmt.Sprintf("%.2f", data.StopPrice)
-			}
-			return "NONE"
-		}(),
-		data.RawSLPct, data.LeveragedSLPct, int(data.Leverage),
+		slText, data.RawSLPct, data.LeveragedSLPct, int(data.Leverage),
 		data.TakePrice, data.RawTPPct, data.LeveragedTPPct, int(data.Leverage),
-		data.RiskReward, data.PotentialProfit,
-		func() float64 {
-			if data.CurrentSLPct > 0 {
-				return math.Abs(data.PotentialLoss)
-			}
-			return 0.00
-		}())
+		data.RiskReward, data.PotentialProfit, potentialLoss)
 
 	return msg
 }
 
-// processPosition handles a single position and manages its stop-loss and take-profit orders
-func processPosition(client *binance.Client, position *binance.PositionRisk,
-	symbolInfo map[string]SymbolPrecision, config Config) error {
-
+// processPosition handles a single position and manages its stop-loss and take-profit orders.
+func (ts *TradingService) processPosition(position *binance.PositionRisk) error {
 	// Skip empty positions
-	posAmt, _ := strconv.ParseFloat(position.PositionAmt, 64)
+	posAmt, err := strconv.ParseFloat(position.PositionAmt, 64)
+	if err != nil {
+		return fmt.Errorf("error parsing position amount: %w", err)
+	}
+
 	if posAmt == 0 {
 		return nil
 	}
 
 	// Extract position details
-	entryPrice, _ := strconv.ParseFloat(position.EntryPrice, 64)
-	markPrice, _ := strconv.ParseFloat(position.MarkPrice, 64)
-	leverage, _ := strconv.ParseFloat(position.Leverage, 64)
+	entryPrice, err := strconv.ParseFloat(position.EntryPrice, 64)
+	if err != nil {
+		return fmt.Errorf("error parsing entry price: %w", err)
+	}
+
+	markPrice, err := strconv.ParseFloat(position.MarkPrice, 64)
+	if err != nil {
+		return fmt.Errorf("error parsing mark price: %w", err)
+	}
+
+	leverage, err := strconv.ParseFloat(position.Leverage, 64)
+	if err != nil {
+		return fmt.Errorf("error parsing leverage: %w", err)
+	}
+
 	symbol := position.Symbol
 	positionSide := position.PositionSide
 
 	// Get precision info for this symbol
-	precision, ok := symbolInfo[symbol]
+	precision, ok := ts.symbolInfo[symbol]
 	if !ok {
 		return fmt.Errorf("precision information not found for %s, skipping", symbol)
 	}
@@ -422,9 +529,35 @@ func processPosition(client *binance.Client, position *binance.PositionRisk,
 		RawProfitPct:     rawProfitPct,
 	}
 
-	// Calculate prices
-	data.StopPrice = calculateStopLoss(data, config)
-	data.TakePrice = calculateTakeProfit(data, config)
+	// Get current stop loss from open orders
+	currentSL, err := ts.getCurrentStopLoss(symbol, positionSide)
+	if err != nil {
+		log.Printf("Warning: Unable to get current stop loss: %v", err)
+	}
+
+	// Calculate new stop loss
+	newSL := ts.calculateStopLoss(data)
+
+	// Use the best stop loss (trailing stop logic)
+	if currentSL > 0 {
+		if (isLong && newSL > currentSL) || (isShort && newSL < currentSL) {
+			// Update to new SL if it's more favorable
+			data.StopPrice = newSL
+			log.Printf("Updating SL for %s from %.2f to %.2f", symbol, currentSL, newSL)
+		} else {
+			// Keep existing SL
+			data.StopPrice = currentSL
+			log.Printf("Keeping SL for %s at %.2f (new SL %.2f is not more favorable)",
+				symbol, currentSL, newSL)
+		}
+	} else {
+		// First time setting SL
+		data.StopPrice = newSL
+		log.Printf("Setting first SL for %s at %.2f", symbol, newSL)
+	}
+
+	// Calculate take profit
+	data.TakePrice = ts.calculateTakeProfit(data)
 
 	// Format values according to symbol precision
 	quantityFormat := fmt.Sprintf("%%.%df", precision.QuantityPrecision)
@@ -455,15 +588,15 @@ func processPosition(client *binance.Client, position *binance.PositionRisk,
 	}
 
 	// Manage orders
-	if err := cancelExistingOrders(client, symbol); err != nil {
+	if err := ts.cancelExistingOrders(symbol); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 
-	if err := createStopLossOrder(client, data); err != nil {
+	if err := ts.createStopLossOrder(data); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 
-	if err := createTakeProfitOrder(client, data); err != nil {
+	if err := ts.createTakeProfitOrder(data); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 
@@ -478,33 +611,72 @@ func processPosition(client *binance.Client, position *binance.PositionRisk,
 	return nil
 }
 
-// main is the entry point of the application
+// processPositions processes all active positions with concurrency.
+func (ts *TradingService) processPositions() error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	// Get all positions
+	positions, err := ts.client.NewGetPositionRiskService().Do(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting positions: %w", err)
+	}
+
+	// Process positions concurrently with a wait group
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(positions))
+
+	for _, position := range positions {
+		wg.Add(1)
+		go func(pos *binance.PositionRisk) {
+			defer wg.Done()
+			if err := ts.processPosition(pos); err != nil {
+				errChan <- fmt.Errorf("error processing position %s: %w", pos.Symbol, err)
+			}
+		}(position)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan)
+
+	// Collect and log errors
+	for err := range errChan {
+		log.Println(err)
+	}
+
+	return nil
+}
+
+// Application timeout constants.
+const (
+	defaultTimeout = 30 * time.Second
+)
+
 func main() {
+	// Set up logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("Starting Binance Futures Guard Bot")
+
 	// Load configuration
 	config := loadConfig()
 
 	// Setup Binance client
 	client, err := setupBinanceClient()
 	if err != nil {
-		log.Fatal("Error connecting to Binance API:", err)
+		log.Fatalf("Error connecting to Binance API: %v", err)
 	}
 
-	// Get symbol precision information
-	symbolInfo, err := getSymbolPrecisions(client)
+	// Create trading service
+	tradingService, err := NewTradingService(client, config)
 	if err != nil {
-		log.Fatal("Error getting exchange information:", err)
+		log.Fatalf("Error initializing trading service: %v", err)
 	}
 
-	// Get all positions
-	positions, err := client.NewGetPositionRiskService().Do(context.Background())
-	if err != nil {
-		log.Fatal("Error getting positions:", err)
+	// Process all positions
+	if err := tradingService.processPositions(); err != nil {
+		log.Fatalf("Error processing positions: %v", err)
 	}
 
-	// Process each position
-	for _, position := range positions {
-		if err := processPosition(client, position, symbolInfo, config); err != nil {
-			log.Printf("Error processing position %s: %v", position.Symbol, err)
-		}
-	}
+	log.Println("Processing complete")
 }

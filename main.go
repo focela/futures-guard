@@ -537,23 +537,40 @@ func (ts *TradingService) processPosition(position *binance.PositionRisk) error 
 
 	// Calculate new stop loss
 	newSL := ts.calculateStopLoss(data)
+	// Store the newly calculated RawSLPct
+	newRawSLPct := data.RawSLPct
 
-	// Use the best stop loss (trailing stop logic)
+	// If there's an existing SL, calculate its raw percentage and compare
 	if currentSL > 0 {
-		if (isLong && newSL > currentSL) || (isShort && newSL < currentSL) {
-			// Update to new SL if it's more favorable
-			data.StopPrice = newSL
-			log.Printf("Updating SL for %s from %.2f to %.2f", symbol, currentSL, newSL)
+		// Calculate raw percentage of current SL
+		var currentRawSLPct float64
+		if isLong {
+			currentRawSLPct = math.Abs(((entryPrice - currentSL) / entryPrice) * 100)
 		} else {
-			// Keep existing SL
+			currentRawSLPct = math.Abs(((currentSL - entryPrice) / entryPrice) * 100)
+		}
+		currentLeveragedSLPct := currentRawSLPct * leverage
+
+		// If the current raw SL percentage is greater than the new raw SL percentage, keep the current SL
+		if currentRawSLPct > newRawSLPct {
+			// Current raw SL percentage is better (further from entry price)
 			data.StopPrice = currentSL
-			log.Printf("Keeping SL for %s at %.2f (new SL %.2f is not more favorable)",
-				symbol, currentSL, newSL)
+			// Update the percentage values for consistency
+			data.RawSLPct = currentRawSLPct
+			data.LeveragedSLPct = currentLeveragedSLPct
+			log.Printf("Keeping SL for %s at %.2f (%.2f%% raw is greater than new %.2f%%)",
+				symbol, currentSL, currentRawSLPct, newRawSLPct)
+		} else {
+			// New SL percentage is greater or equal
+			data.StopPrice = newSL
+			log.Printf("Updating SL for %s from %.2f to %.2f (%.2f%% raw to %.2f%%)",
+				symbol, currentSL, newSL, currentRawSLPct, newRawSLPct)
 		}
 	} else {
 		// First time setting SL
 		data.StopPrice = newSL
-		log.Printf("Setting first SL for %s at %.2f", symbol, newSL)
+		log.Printf("Setting first SL for %s at %.2f (%.2f%% raw)",
+			symbol, newSL, newRawSLPct)
 	}
 
 	// Calculate take profit

@@ -205,42 +205,107 @@ func getSymbolPrecisions(client *binance.Client) (map[string]SymbolPrecision, er
 	return symbolInfo, nil
 }
 
-// calculateStopLoss determines the stop-loss price based on current profit levels.
+// Fixed calculateStopLoss function with precise calculations
 func (ts *TradingService) calculateStopLoss(data *PositionData) float64 {
 	// Determine current stop-loss percentage based on profit levels
 	currentSLPct := ts.config.DefaultSLPercent
-	for _, level := range ts.stopLevels {
-		if data.CurrentProfitPct >= level.ProfitThreshold {
-			currentSLPct = level.StopLossValue
-		} else {
-			break
+	log.Printf("DEBUG: Initial SL%% for %s set to %.2f%%", data.Symbol, currentSLPct)
+
+	// Only adjust stop-loss based on profit levels if we're in profit
+	// and hit at least the first threshold
+	if data.CurrentProfitPct > 0 {
+		thresholdReached := false
+		for _, level := range ts.stopLevels {
+			if data.CurrentProfitPct >= level.ProfitThreshold {
+				currentSLPct = level.StopLossValue
+				thresholdReached = true
+				log.Printf("DEBUG: Adjusted SL%% to %.2f%% based on profit threshold %.2f%%",
+					currentSLPct, level.ProfitThreshold)
+			} else {
+				break
+			}
+		}
+
+		// If no threshold reached but in profit, keep using the default SL percent
+		if !thresholdReached {
+			log.Printf("DEBUG: Using default SL%% of %.2f%% for position with profit %.2f%% (below first threshold)",
+				currentSLPct, data.CurrentProfitPct)
 		}
 	}
 	data.CurrentSLPct = currentSLPct
 
-	// Calculate stop price based on position direction and settings
+	// Calculate stop price based on position direction
 	var stopPrice float64
+
+	// IMPORTANT FIX: For positions below threshold, the SL calculation logic was incorrect
+	// For default behavior (below thresholds), we want:
+	// - Long positions: SL below entry price by DefaultSLPercent
+	// - Short positions: SL above entry price by DefaultSLPercent
+
 	if data.IsLong {
-		if ts.config.SLFixed {
-			stopPrice = data.EntryPrice * (1 + currentSLPct/data.Leverage/100)
+		if currentSLPct == 0 {
+			// At breakeven
+			stopPrice = data.EntryPrice
+			log.Printf("DEBUG: Long SL calculation: Breakeven at entry=%.8f", data.EntryPrice)
+		} else if data.CurrentProfitPct >= ts.stopLevels[0].ProfitThreshold {
+			// We're above threshold - lock in profit at specified level above entry
+			profitPercentToSecure := currentSLPct / data.Leverage
+			stopPrice = data.EntryPrice * (1 + profitPercentToSecure/100)
+			log.Printf("DEBUG: Long SL calculation (above threshold): Entry=%.8f * (1 + %.4f/100) = %.8f",
+				data.EntryPrice, profitPercentToSecure, stopPrice)
 		} else {
-			stopPrice = data.MarkPrice - (data.MarkPrice-data.EntryPrice)*(currentSLPct/data.CurrentProfitPct)
+			// Default behavior - SL below entry by DefaultSLPercent
+			// Note: This is a fixed percentage of the entry price
+			rawSLPct := currentSLPct
+			stopPrice = data.EntryPrice * (1 - rawSLPct/100)
+			log.Printf("DEBUG: Long SL calculation (below threshold): Entry=%.8f * (1 - %.4f/100) = %.8f",
+				data.EntryPrice, rawSLPct, stopPrice)
 		}
 	} else {
-		if ts.config.SLFixed {
-			stopPrice = data.EntryPrice * (1 - currentSLPct/data.Leverage/100)
+		// For short positions
+		if currentSLPct == 0 {
+			// At breakeven
+			stopPrice = data.EntryPrice
+			log.Printf("DEBUG: Short SL calculation: Breakeven at entry=%.8f", data.EntryPrice)
+		} else if data.CurrentProfitPct >= ts.stopLevels[0].ProfitThreshold {
+			// We're above threshold - lock in profit at specified level below entry
+			profitPercentToSecure := currentSLPct / data.Leverage
+			stopPrice = data.EntryPrice * (1 - profitPercentToSecure/100)
+			log.Printf("DEBUG: Short SL calculation (above threshold): Entry=%.8f * (1 - %.4f/100) = %.8f",
+				data.EntryPrice, profitPercentToSecure, stopPrice)
 		} else {
-			stopPrice = data.MarkPrice + (data.EntryPrice-data.MarkPrice)*(currentSLPct/data.CurrentProfitPct)
+			// Default behavior - SL above entry by DefaultSLPercent
+			// THIS IS THE KEY FIX - for positions below threshold, we use the raw percentage
+			// directly (not divided by leverage) to calculate the stop price
+			rawSLPct := currentSLPct
+			stopPrice = data.EntryPrice * (1 + rawSLPct/100)
+			log.Printf("DEBUG: Short SL calculation (below threshold): Entry=%.8f * (1 + %.4f/100) = %.8f",
+				data.EntryPrice, rawSLPct, stopPrice)
 		}
 	}
 
 	// Calculate raw and leveraged percentages for reporting
 	if data.IsLong {
-		data.RawSLPct = math.Abs(((data.EntryPrice - stopPrice) / data.EntryPrice) * 100)
+		if stopPrice >= data.EntryPrice {
+			// SL is above entry (in profit)
+			data.RawSLPct = ((stopPrice - data.EntryPrice) / data.EntryPrice) * 100
+		} else {
+			// SL is below entry (at loss)
+			data.RawSLPct = -((data.EntryPrice - stopPrice) / data.EntryPrice) * 100
+		}
 	} else {
-		data.RawSLPct = math.Abs(((stopPrice - data.EntryPrice) / data.EntryPrice) * 100)
+		if stopPrice <= data.EntryPrice {
+			// SL is below entry (in profit)
+			data.RawSLPct = ((data.EntryPrice - stopPrice) / data.EntryPrice) * 100
+		} else {
+			// SL is above entry (at loss)
+			data.RawSLPct = -((stopPrice - data.EntryPrice) / data.EntryPrice) * 100
+		}
 	}
 	data.LeveragedSLPct = data.RawSLPct * data.Leverage
+
+	log.Printf("DEBUG: Final SL for %s: price=%.8f, raw=%.2f%%, leveraged=%.2f%%",
+		data.Symbol, stopPrice, data.RawSLPct, data.LeveragedSLPct)
 
 	return stopPrice
 }
@@ -430,26 +495,31 @@ func formatPositionMessage(data *PositionData) string {
 	if data.IsLong {
 		sideIcon = "🟢 LONG"
 	}
-
 	// Format the message
 	var slText string
 	if data.CurrentSLPct >= 0 && data.StopPrice > 0 {
-		slText = fmt.Sprintf("%.2f", data.StopPrice)
+		slText = fmt.Sprintf("%.8f", data.StopPrice)
 	} else {
 		slText = "NONE"
 	}
-
-	var potentialLoss float64
+	var potentialLossDisplay float64
 	if data.CurrentSLPct > 0 {
-		potentialLoss = math.Abs(data.PotentialLoss)
+		potentialLossDisplay = math.Abs(data.PotentialLoss)
+	} else {
+		potentialLossDisplay = math.Abs(data.PotentialLoss)
 	}
 
-	// Format the message
+	// Add negative sign to potential loss when RawSLPct is negative
+	if data.RawSLPct < 0 {
+		potentialLossDisplay = -potentialLossDisplay
+	}
+
+	// Format the message with higher precision for price values
 	msg := fmt.Sprintf(`📊 %s %s
-💵 Entry: %.2f  📉 Mark: %.2f
+💵 Entry: %.8f  📉 Mark: %.8f
 💹 P/L: %.2f%% (%.2f%% x%d)
 🛑 SL: %s (%.2f%% / %.2f%% x%d)  
-🎯 TP: %.2f (%.2f%% / %.2f%% x%d)
+🎯 TP: %.8f (%.2f%% / %.2f%% x%d)
 ⚖️ Risk/Reward: %.2f
 💰 Potential Profit: %.2f USD
 💸 Potential Loss: %.2f USD`,
@@ -458,8 +528,7 @@ func formatPositionMessage(data *PositionData) string {
 		data.CurrentProfitPct, data.RawProfitPct, int(data.Leverage),
 		slText, data.RawSLPct, data.LeveragedSLPct, int(data.Leverage),
 		data.TakePrice, data.RawTPPct, data.LeveragedTPPct, int(data.Leverage),
-		data.RiskReward, data.PotentialProfit, potentialLoss)
-
+		data.RiskReward, data.PotentialProfit, potentialLossDisplay)
 	return msg
 }
 
@@ -629,11 +698,19 @@ func (ts *TradingService) updatePositionOrders(data *PositionData) error {
 		data.PotentialProfit = (data.EntryPrice - data.TakePrice) * data.AbsAmt
 	}
 
+	// FIXED: Calculate potential loss correctly based on stop price, regardless of CurrentSLPct
 	data.PotentialLoss = 0.0
-	if data.CurrentSLPct > 0 {
-		data.PotentialLoss = (data.EntryPrice - data.StopPrice) * data.AbsAmt
-		if data.PositionAmt < 0 {
+	if data.StopPrice > 0 {
+		if data.IsLong {
+			// For long positions, loss is when price goes below entry
 			data.PotentialLoss = (data.StopPrice - data.EntryPrice) * data.AbsAmt
+		} else {
+			// For short positions, loss is when price goes above entry
+			data.PotentialLoss = (data.EntryPrice - data.StopPrice) * data.AbsAmt
+		}
+		// If the calculation results in a positive value for what should be a loss, negate it
+		if data.PotentialLoss > 0 {
+			data.PotentialLoss = -data.PotentialLoss
 		}
 	}
 

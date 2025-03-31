@@ -533,25 +533,29 @@ func (ts *TradingService) updatePositionOrders(data *PositionData) error {
 		currentLeveragedSLPct := currentRawSLPct * data.Leverage
 
 		// If the current raw SL percentage is greater than the new raw SL percentage, keep the current SL
-		if currentRawSLPct > newRawSLPct {
-			// Current raw SL percentage is better (further from entry price)
+		priceDifference := math.Abs(currentSL - newSL)
+		slPriceThreshold := 0.0001 * data.EntryPrice
+
+		// If current SL price is better or difference is too small, do not update
+		if currentRawSLPct > newRawSLPct || priceDifference < slPriceThreshold {
+			// Keep current SL
 			data.StopPrice = currentSL
-			// Update the percentage values for consistency
+			// Update percentage values ​​to ensure consistency
 			data.RawSLPct = currentRawSLPct
 			data.LeveragedSLPct = currentLeveragedSLPct
 			slNeedsUpdate = false
-			log.Printf("Keeping SL for %s at %.2f (%.2f%% raw is greater than new %.2f%%)",
-				data.Symbol, currentSL, currentRawSLPct, newRawSLPct)
+			log.Printf("Keeping SL for %s at %.4f (raw %.4f%% > new %.4f%% or diff %.6f < threshold %.6f)",
+				data.Symbol, currentSL, currentRawSLPct, newRawSLPct, priceDifference, slPriceThreshold)
 		} else {
 			// New SL percentage is greater or equal
 			data.StopPrice = newSL
-			log.Printf("Updating SL for %s from %.2f to %.2f (%.2f%% raw to %.2f%%)",
-				data.Symbol, currentSL, newSL, currentRawSLPct, newRawSLPct)
+			log.Printf("Updating SL for %s from %.4f to %.4f (raw %.4f%% to %.4f%%, diff %.6f)",
+				data.Symbol, currentSL, newSL, currentRawSLPct, newRawSLPct, priceDifference)
 		}
 	} else {
 		// First time setting SL
 		data.StopPrice = newSL
-		log.Printf("Setting first SL for %s at %.2f (%.2f%% raw)",
+		log.Printf("Setting first SL for %s at %.4f (%.4f%% raw)",
 			data.Symbol, newSL, newRawSLPct)
 	}
 

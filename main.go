@@ -356,7 +356,7 @@ func getOrderSideInfo(positionSide string, posAmt float64) (binance.SideType, bi
 
 // createStopLossOrder places a stop-loss order for a position.
 func (ts *TradingService) createStopLossOrder(data *PositionData) error {
-	if data.CurrentSLPct <= 0 || data.StopPrice <= 0 || data.StopPrice == data.EntryPrice {
+	if data.CurrentSLPct < 0 || data.StopPrice <= 0 {
 		return nil // No stop-loss needed
 	}
 
@@ -433,7 +433,7 @@ func formatPositionMessage(data *PositionData) string {
 
 	// Format the message
 	var slText string
-	if data.CurrentSLPct > 0 {
+	if data.CurrentSLPct >= 0 && data.StopPrice > 0 {
 		slText = fmt.Sprintf("%.2f", data.StopPrice)
 	} else {
 		slText = "NONE"
@@ -461,6 +461,277 @@ func formatPositionMessage(data *PositionData) string {
 		data.RiskReward, data.PotentialProfit, potentialLoss)
 
 	return msg
+}
+
+// getCurrentTakeProfit retrieves the current take-profit price from open orders.
+func (ts *TradingService) getCurrentTakeProfit(symbol string, positionSide string) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	// Get all open orders for the symbol
+	openOrders, err := ts.client.NewListOpenOrdersService().Symbol(symbol).Do(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching open orders for %s: %w", symbol, err)
+	}
+
+	// Find take-profit order
+	for _, order := range openOrders {
+		// Check if this is a take-profit order (TAKE_PROFIT_MARKET)
+		if order.Type == "TAKE_PROFIT_MARKET" {
+			// Check position side based on value
+			// Skip this check if positionSide is "BOTH"
+			if positionSide != "BOTH" {
+				// Convert both to comparable strings for safe comparison
+				orderPosSide := order.PositionSide
+				if (positionSide == "LONG" && orderPosSide != "LONG") ||
+					(positionSide == "SHORT" && orderPosSide != "SHORT") {
+					continue
+				}
+			}
+
+			// Get the stop price (which is actually the take-profit price in this case)
+			takePrice, err := strconv.ParseFloat(order.StopPrice, 64)
+			if err != nil {
+				return 0, fmt.Errorf("error parsing take profit price: %w", err)
+			}
+			return takePrice, nil
+		}
+	}
+
+	// No take-profit order found
+	return 0, nil
+}
+
+// updatePositionOrders cancels existing orders and creates new ones only if necessary
+func (ts *TradingService) updatePositionOrders(data *PositionData) error {
+	// Get current stop loss and take profit from open orders
+	currentSL, err := ts.getCurrentStopLoss(data.Symbol, data.PositionSide)
+	if err != nil {
+		log.Printf("Warning: Unable to get current stop loss: %v", err)
+	}
+
+	currentTP, err := ts.getCurrentTakeProfit(data.Symbol, data.PositionSide)
+	if err != nil {
+		log.Printf("Warning: Unable to get current take profit: %v", err)
+	}
+
+	// Calculate new stop loss
+	newSL := ts.calculateStopLoss(data)
+	// Store the newly calculated RawSLPct
+	newRawSLPct := data.RawSLPct
+
+	// Determine if we need to update the stop loss
+	slNeedsUpdate := true
+	if currentSL > 0 {
+		// Calculate raw percentage of current SL
+		var currentRawSLPct float64
+		if data.IsLong {
+			currentRawSLPct = math.Abs(((data.EntryPrice - currentSL) / data.EntryPrice) * 100)
+		} else {
+			currentRawSLPct = math.Abs(((currentSL - data.EntryPrice) / data.EntryPrice) * 100)
+		}
+		currentLeveragedSLPct := currentRawSLPct * data.Leverage
+
+		// If the current raw SL percentage is greater than the new raw SL percentage, keep the current SL
+		if currentRawSLPct > newRawSLPct {
+			// Current raw SL percentage is better (further from entry price)
+			data.StopPrice = currentSL
+			// Update the percentage values for consistency
+			data.RawSLPct = currentRawSLPct
+			data.LeveragedSLPct = currentLeveragedSLPct
+			slNeedsUpdate = false
+			log.Printf("Keeping SL for %s at %.2f (%.2f%% raw is greater than new %.2f%%)",
+				data.Symbol, currentSL, currentRawSLPct, newRawSLPct)
+		} else {
+			// New SL percentage is greater or equal
+			data.StopPrice = newSL
+			log.Printf("Updating SL for %s from %.2f to %.2f (%.2f%% raw to %.2f%%)",
+				data.Symbol, currentSL, newSL, currentRawSLPct, newRawSLPct)
+		}
+	} else {
+		// First time setting SL
+		data.StopPrice = newSL
+		log.Printf("Setting first SL for %s at %.2f (%.2f%% raw)",
+			data.Symbol, newSL, newRawSLPct)
+	}
+
+	// Calculate take profit
+	newTP := ts.calculateTakeProfit(data)
+	data.TakePrice = newTP
+
+	// Check if TP has already been reached
+	tpReached := (data.IsLong && data.MarkPrice >= data.TakePrice) ||
+		(data.IsShort && data.MarkPrice <= data.TakePrice)
+
+	// Debug logs for TP values
+	log.Printf("TP Debug for %s: Current TP = %.4f, New calculated TP = %.4f, Mark price = %.4f",
+		data.Symbol, currentTP, newTP, data.MarkPrice)
+
+	// Determine if we need to update the take profit
+	tpNeedsUpdate := false // Default to NOT updating
+
+	// First check if we don't have a TP yet
+	if currentTP <= 0 {
+		// No current TP exists, we need to create one
+		tpNeedsUpdate = true
+		log.Printf("No existing TP for %s, will create new TP at %.4f",
+			data.Symbol, newTP)
+	} else {
+		// Calculate the difference between current and new TP as a percentage
+		tpDiffPercent := math.Abs((currentTP - newTP) / currentTP * 100)
+		log.Printf("TP difference for %s: %.4f%% (current: %.4f, new: %.4f)",
+			data.Symbol, tpDiffPercent, currentTP, newTP)
+
+		// Only update if the difference is significant (e.g., more than 0.5%)
+		if tpDiffPercent > 0.5 {
+			tpNeedsUpdate = true
+			log.Printf("TP difference %.4f%% is significant, will update TP for %s from %.4f to %.4f",
+				tpDiffPercent, data.Symbol, currentTP, newTP)
+		} else {
+			// Keep the current TP if difference is small
+			data.TakePrice = currentTP
+			log.Printf("Keeping current TP for %s at %.4f (difference %.4f%% is insignificant)",
+				data.Symbol, currentTP, tpDiffPercent)
+		}
+	}
+
+	// Check if TP has already been reached (price touched/crossed TP level)
+	if tpReached {
+		log.Printf("TP for %s (%s) already reached: current price = %.4f, TP price = %.4f",
+			data.Symbol, data.PositionSide, data.MarkPrice, data.TakePrice)
+		// If TP is reached but we have no TP order, we should still set one slightly above/below current price
+		if currentTP <= 0 {
+			tpNeedsUpdate = true
+			log.Printf("TP already reached but no TP order exists, will create one for %s", data.Symbol)
+		}
+	}
+
+	// Format values according to symbol precision
+	precision, ok := ts.symbolInfo[data.Symbol]
+	if !ok {
+		return fmt.Errorf("precision information not found for %s", data.Symbol)
+	}
+
+	quantityFormat := fmt.Sprintf("%%.%df", precision.QuantityPrecision)
+	priceFormat := fmt.Sprintf("%%.%df", precision.PricePrecision)
+
+	data.Quantity = fmt.Sprintf(quantityFormat, data.AbsAmt)
+	data.StopPriceStr = fmt.Sprintf(priceFormat, data.StopPrice)
+	data.TakePriceStr = fmt.Sprintf(priceFormat, data.TakePrice)
+
+	// Calculate potential profit and loss
+	data.PotentialProfit = (data.TakePrice - data.EntryPrice) * data.AbsAmt
+	if data.PositionAmt < 0 {
+		data.PotentialProfit = (data.EntryPrice - data.TakePrice) * data.AbsAmt
+	}
+
+	data.PotentialLoss = 0.0
+	if data.CurrentSLPct > 0 {
+		data.PotentialLoss = (data.EntryPrice - data.StopPrice) * data.AbsAmt
+		if data.PositionAmt < 0 {
+			data.PotentialLoss = (data.StopPrice - data.EntryPrice) * data.AbsAmt
+		}
+	}
+
+	// Calculate risk-reward ratio
+	data.RiskReward = 0.0
+	if data.PotentialLoss != 0 {
+		data.RiskReward = math.Abs(data.PotentialProfit / data.PotentialLoss)
+	}
+
+	log.Printf("Order update status for %s: SL needs update: %v, TP needs update: %v",
+		data.Symbol, slNeedsUpdate, tpNeedsUpdate)
+
+	// We'll handle SL and TP separately to avoid unnecessary cancellations
+	if slNeedsUpdate && tpNeedsUpdate {
+		// Both need updates, cancel all and recreate both
+		log.Printf("Both SL and TP need updates for %s, cancelling all orders", data.Symbol)
+		if err := ts.cancelExistingOrders(data.Symbol); err != nil {
+			log.Printf("Warning: %v", err)
+		}
+
+		// Create new SL order
+		if err := ts.createStopLossOrder(data); err != nil {
+			log.Printf("Warning: %v", err)
+		} else {
+			log.Printf("Successfully created new SL order for %s at %s", data.Symbol, data.StopPriceStr)
+		}
+
+		// Create new TP order
+		if err := ts.createTakeProfitOrder(data); err != nil {
+			log.Printf("Warning: %v", err)
+		} else {
+			log.Printf("Successfully created new TP order for %s at %s", data.Symbol, data.TakePriceStr)
+		}
+	} else if slNeedsUpdate {
+		// Only SL needs update
+		log.Printf("Only SL needs update for %s", data.Symbol)
+
+		// Get all open orders to find and cancel only SL
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+
+		openOrders, err := ts.client.NewListOpenOrdersService().Symbol(data.Symbol).Do(ctx)
+		if err != nil {
+			log.Printf("Error fetching open orders for selective cancellation: %v", err)
+			return err
+		}
+
+		// Find and cancel only stop-loss orders
+		for _, order := range openOrders {
+			if order.Type == "STOP_MARKET" {
+				_, err := ts.client.NewCancelOrderService().Symbol(data.Symbol).OrderID(order.OrderID).Do(ctx)
+				if err != nil {
+					log.Printf("Error canceling SL order %d for %s: %v", order.OrderID, data.Symbol, err)
+				} else {
+					log.Printf("Successfully cancelled SL order %d for %s", order.OrderID, data.Symbol)
+				}
+			}
+		}
+
+		// Create new SL order
+		if err := ts.createStopLossOrder(data); err != nil {
+			log.Printf("Warning: %v", err)
+		} else {
+			log.Printf("Successfully created new SL order for %s at %s", data.Symbol, data.StopPriceStr)
+		}
+	} else if tpNeedsUpdate {
+		// Only TP needs update
+		log.Printf("Only TP needs update for %s", data.Symbol)
+
+		// Get all open orders to find and cancel only TP
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+
+		openOrders, err := ts.client.NewListOpenOrdersService().Symbol(data.Symbol).Do(ctx)
+		if err != nil {
+			log.Printf("Error fetching open orders for selective cancellation: %v", err)
+			return err
+		}
+
+		// Find and cancel only take-profit orders
+		for _, order := range openOrders {
+			if order.Type == "TAKE_PROFIT_MARKET" {
+				_, err := ts.client.NewCancelOrderService().Symbol(data.Symbol).OrderID(order.OrderID).Do(ctx)
+				if err != nil {
+					log.Printf("Error canceling TP order %d for %s: %v", order.OrderID, data.Symbol, err)
+				} else {
+					log.Printf("Successfully cancelled TP order %d for %s", order.OrderID, data.Symbol)
+				}
+			}
+		}
+
+		// Create new TP order
+		if err := ts.createTakeProfitOrder(data); err != nil {
+			log.Printf("Warning: %v", err)
+		} else {
+			log.Printf("Successfully created new TP order for %s at %s", data.Symbol, data.TakePriceStr)
+		}
+	} else {
+		log.Printf("No changes needed for %s orders", data.Symbol)
+	}
+
+	return nil
 }
 
 // processPosition handles a single position and manages its stop-loss and take-profit orders.
@@ -494,9 +765,8 @@ func (ts *TradingService) processPosition(position *binance.PositionRisk) error 
 	symbol := position.Symbol
 	positionSide := position.PositionSide
 
-	// Get precision info for this symbol
-	precision, ok := ts.symbolInfo[symbol]
-	if !ok {
+	// Check if we have precision info for this symbol
+	if _, ok := ts.symbolInfo[symbol]; !ok {
 		return fmt.Errorf("precision information not found for %s, skipping", symbol)
 	}
 
@@ -529,92 +799,9 @@ func (ts *TradingService) processPosition(position *binance.PositionRisk) error 
 		RawProfitPct:     rawProfitPct,
 	}
 
-	// Get current stop loss from open orders
-	currentSL, err := ts.getCurrentStopLoss(symbol, positionSide)
-	if err != nil {
-		log.Printf("Warning: Unable to get current stop loss: %v", err)
-	}
-
-	// Calculate new stop loss
-	newSL := ts.calculateStopLoss(data)
-	// Store the newly calculated RawSLPct
-	newRawSLPct := data.RawSLPct
-
-	// If there's an existing SL, calculate its raw percentage and compare
-	if currentSL > 0 {
-		// Calculate raw percentage of current SL
-		var currentRawSLPct float64
-		if isLong {
-			currentRawSLPct = math.Abs(((entryPrice - currentSL) / entryPrice) * 100)
-		} else {
-			currentRawSLPct = math.Abs(((currentSL - entryPrice) / entryPrice) * 100)
-		}
-		currentLeveragedSLPct := currentRawSLPct * leverage
-
-		// If the current raw SL percentage is greater than the new raw SL percentage, keep the current SL
-		if currentRawSLPct > newRawSLPct {
-			// Current raw SL percentage is better (further from entry price)
-			data.StopPrice = currentSL
-			// Update the percentage values for consistency
-			data.RawSLPct = currentRawSLPct
-			data.LeveragedSLPct = currentLeveragedSLPct
-			log.Printf("Keeping SL for %s at %.2f (%.2f%% raw is greater than new %.2f%%)",
-				symbol, currentSL, currentRawSLPct, newRawSLPct)
-		} else {
-			// New SL percentage is greater or equal
-			data.StopPrice = newSL
-			log.Printf("Updating SL for %s from %.2f to %.2f (%.2f%% raw to %.2f%%)",
-				symbol, currentSL, newSL, currentRawSLPct, newRawSLPct)
-		}
-	} else {
-		// First time setting SL
-		data.StopPrice = newSL
-		log.Printf("Setting first SL for %s at %.2f (%.2f%% raw)",
-			symbol, newSL, newRawSLPct)
-	}
-
-	// Calculate take profit
-	data.TakePrice = ts.calculateTakeProfit(data)
-
-	// Format values according to symbol precision
-	quantityFormat := fmt.Sprintf("%%.%df", precision.QuantityPrecision)
-	priceFormat := fmt.Sprintf("%%.%df", precision.PricePrecision)
-
-	data.Quantity = fmt.Sprintf(quantityFormat, absAmt)
-	data.StopPriceStr = fmt.Sprintf(priceFormat, data.StopPrice)
-	data.TakePriceStr = fmt.Sprintf(priceFormat, data.TakePrice)
-
-	// Calculate potential profit and loss
-	data.PotentialProfit = (data.TakePrice - data.EntryPrice) * absAmt
-	if posAmt < 0 {
-		data.PotentialProfit = (data.EntryPrice - data.TakePrice) * absAmt
-	}
-
-	data.PotentialLoss = 0.0
-	if data.CurrentSLPct > 0 {
-		data.PotentialLoss = (data.EntryPrice - data.StopPrice) * absAmt
-		if posAmt < 0 {
-			data.PotentialLoss = (data.StopPrice - data.EntryPrice) * absAmt
-		}
-	}
-
-	// Calculate risk-reward ratio
-	data.RiskReward = 0.0
-	if data.PotentialLoss != 0 {
-		data.RiskReward = math.Abs(data.PotentialProfit / data.PotentialLoss)
-	}
-
-	// Manage orders
-	if err := ts.cancelExistingOrders(symbol); err != nil {
-		log.Printf("Warning: %v", err)
-	}
-
-	if err := ts.createStopLossOrder(data); err != nil {
-		log.Printf("Warning: %v", err)
-	}
-
-	if err := ts.createTakeProfitOrder(data); err != nil {
-		log.Printf("Warning: %v", err)
+	// Update orders (this will handle SL and TP checking and placement)
+	if err := ts.updatePositionOrders(data); err != nil {
+		return fmt.Errorf("error updating orders: %w", err)
 	}
 
 	// Format and send position message

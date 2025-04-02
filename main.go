@@ -86,8 +86,8 @@ func NewTradingService(client *binance.Client, config Config) (*TradingService, 
 	// Initialize stop-loss levels
 	stopLevels := []StopLossLevel{
 		{150, 0}, {300, 100}, {450, 200}, {600, 300},
-		{750, 400}, {900, 500}, {1050, 600}, {1200, 700},
-		{1350, 800}, {1500, 900},
+		{750, 550}, {900, 750}, {1050, 900}, {1200, 1100},
+		{1350, 1250}, {1500, 1400},
 	}
 
 	// Get symbol precision information

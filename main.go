@@ -589,27 +589,61 @@ func (ts *TradingService) updatePositionOrders(data *PositionData) error {
 	// Store the newly calculated RawSLPct
 	newRawSLPct := data.RawSLPct
 
+	// Determine which profit threshold we're at
+	currentThreshold := -1
+	for i, level := range ts.stopLevels {
+		if data.CurrentProfitPct >= level.ProfitThreshold {
+			currentThreshold = i
+		} else {
+			break
+		}
+	}
+
 	// Determine if we need to update the stop loss
 	slNeedsUpdate := true
 	if currentSL > 0 {
 		// Calculate raw percentage of current SL
 		var currentRawSLPct float64
 		if data.IsLong {
-			currentRawSLPct = math.Abs(((data.EntryPrice - currentSL) / data.EntryPrice) * 100)
+			if currentSL >= data.EntryPrice {
+				currentRawSLPct = ((currentSL - data.EntryPrice) / data.EntryPrice) * 100
+			} else {
+				currentRawSLPct = -((data.EntryPrice - currentSL) / data.EntryPrice) * 100
+			}
 		} else {
-			currentRawSLPct = math.Abs(((currentSL - data.EntryPrice) / data.EntryPrice) * 100)
+			if currentSL <= data.EntryPrice {
+				currentRawSLPct = ((data.EntryPrice - currentSL) / data.EntryPrice) * 100
+			} else {
+				currentRawSLPct = -((currentSL - data.EntryPrice) / data.EntryPrice) * 100
+			}
 		}
 		currentLeveragedSLPct := currentRawSLPct * data.Leverage
 
-		// If the current raw SL percentage is greater than the new raw SL percentage, keep the current SL
+		// Calculate which threshold the current SL corresponds to
+		currentSLThreshold := -1
+		for i, level := range ts.stopLevels {
+			if math.Abs(currentRawSLPct-level.StopLossValue/data.Leverage) < 0.1 {
+				currentSLThreshold = i
+				break
+			}
+		}
+
 		priceDifference := math.Abs(currentSL - newSL)
 		slPriceThreshold := 0.0001 * data.EntryPrice
 
-		// If current SL price is better or difference is too small, do not update
-		if currentRawSLPct > newRawSLPct || priceDifference < slPriceThreshold {
-			// Keep current SL
+		log.Printf("DEBUG: Current SL threshold: %d, New threshold: %d, Current profit: %.2f%%",
+			currentSLThreshold, currentThreshold, data.CurrentProfitPct)
+
+		// FORCE UPDATE SL IF WE'VE CROSSED A NEW THRESHOLD
+		if currentThreshold > currentSLThreshold {
+			// We've crossed a new threshold, definitely update
+			data.StopPrice = newSL
+			log.Printf("THRESHOLD CROSSED: Updating SL for %s from %.4f to %.4f (threshold %d -> %d)",
+				data.Symbol, currentSL, newSL, currentSLThreshold, currentThreshold)
+		} else if currentRawSLPct > newRawSLPct || priceDifference < slPriceThreshold {
+			// If current SL price is better or difference is too small, do not update
 			data.StopPrice = currentSL
-			// Update percentage values ​​to ensure consistency
+			// Update percentage values to ensure consistency
 			data.RawSLPct = currentRawSLPct
 			data.LeveragedSLPct = currentLeveragedSLPct
 			slNeedsUpdate = false

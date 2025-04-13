@@ -85,9 +85,15 @@ type TradingService struct {
 func NewTradingService(client *binance.Client, config Config) (*TradingService, error) {
 	// Initialize stop-loss levels
 	stopLevels := []StopLossLevel{
-		{150, 0}, {300, 100}, {450, 200}, {600, 300},
-		{750, 550}, {900, 750}, {1050, 900}, {1200, 1100},
-		{1350, 1250}, {1500, 1400},
+		{300, 0},     // Initial stage, no SL adjustment yet
+		{450, 150},   // Start light capital protection
+		{600, 300},   // RR 1:1, begin locking in profits
+		{750, 450},   // Move SL higher but still leave room for breakout
+		{900, 600},   // RR 1.5:1, locking more profit
+		{1050, 750},  // Gradually increase the protection level
+		{1200, 900},  // Secure at least 900 in profit
+		{1350, 1050}, // Protect 1050 profit level
+		{1500, 1200}, // Lock in a solid 1200 profit
 	}
 
 	// Get symbol precision information
